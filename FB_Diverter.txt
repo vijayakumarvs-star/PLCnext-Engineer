@@ -1,0 +1,217 @@
+(*
+===============================================================================
+ Function Block : FB_Diverter
+ Library        : Library
+ Description    : Pneumatic Diverter Controller (2 Feedback Inputs / 2 Outputs)
+ Author         : Vijayakumar V S
+ Version        : V1.1
+ Date           : 10-Jul-2026
+ 
+===============================================================================
+ Revision History
+===============================================================================
+
+V1.1
+- Updated operating modes (Manual / Auto / OOS / Bypass)
+- Added startup position validation
+- Added Out Of Service mode
+- Enable input active only in Auto mode
+- Improved fault handling
+- Improved HMI status reporting
+- Refined state machine logic
+
+V1.0
+- Initial release
+
+===============================================================================
+*)
+
+
+
+
+
+(* ========================================================================== *)
+(* 1. TIMERS EXECUTION (Unconditional evaluation at top of scan)              *)
+(* ========================================================================== *)
+tonMoveTimer(
+    IN := (State = STATE_MOVE_WAY1 OR State = STATE_MOVE_WAY2) AND NOT FaultActive, 
+    PT := MoveTimeout
+);
+tonNoFeedback(
+    IN := (State = STATE_IDLE OR State = STATE_AT_WAY1 OR State = STATE_AT_WAY2) 
+          AND NOT FeedbackWay1 AND NOT FeedbackWay2 AND NOT FaultActive,
+    PT := T#3S
+);
+(* ========================================================================== *)
+(* 2. INITIALIZATION                                                          *)
+(* ========================================================================== *)
+IF NOT Initialized THEN
+    IF FeedbackWay1 AND NOT FeedbackWay2 THEN
+        State := STATE_AT_WAY1;
+    ELSIF FeedbackWay2 AND NOT FeedbackWay1 THEN
+        State := STATE_AT_WAY2;
+    ELSE
+        FaultActive := TRUE; 
+        FaultCode := 120; // Unknown Position at Startup
+        State := STATE_FAULT;
+    END_IF;
+    Initialized := TRUE;
+    
+    // Ensure outputs start safely
+    iOutWay1 := FALSE;
+    iOutWay2 := FALSE;
+END_IF;
+(* ========================================================================== *)
+(* 3. INPUT VALIDATION                                                        *)
+(* ========================================================================== *)
+InvalidMode := (ModeWord > WORD#3);
+InvalidCmd  := (CommandWord > WORD#3);
+(* ========================================================================== *)
+(* 4. COMMAND EVALUATION                                                      *)
+(* ========================================================================== *)
+// Edge detect HMI commands to prevent unexpected firing on mode transitions
+r_trigCmdWay1(CLK := (CommandWord = WORD#1));
+r_trigCmdWay2(CLK := (CommandWord = WORD#2));
+ExecuteWay1 := FALSE;
+ExecuteWay2 := FALSE;
+CASE TO_INT(ModeWord) OF
+    0: // Manual
+        IF NOT FaultActive AND NOT InvalidMode THEN
+            IF r_trigCmdWay1.Q THEN ExecuteWay1 := TRUE; END_IF;
+            IF r_trigCmdWay2.Q THEN ExecuteWay2 := TRUE; END_IF;
+        END_IF;
+    1: // Auto
+        IF Enable AND NOT FaultActive AND NOT InvalidMode THEN
+            IF r_trigCmdWay1.Q AND PermissiveWay1 THEN ExecuteWay1 := TRUE; END_IF;
+            IF r_trigCmdWay2.Q AND PermissiveWay2 THEN ExecuteWay2 := TRUE; END_IF;
+        END_IF;
+    2: // OOS
+        ;
+    3: // Bypass
+        IF NOT FaultActive AND NOT InvalidMode THEN
+            IF r_trigCmdWay1.Q THEN ExecuteWay1 := TRUE; END_IF;
+            IF r_trigCmdWay2.Q THEN ExecuteWay2 := TRUE; END_IF;
+        END_IF;
+END_CASE;
+(* ========================================================================== *)
+(* 5. FAULT HANDLING                                                          *)
+(* ========================================================================== *)
+rtReset(CLK := (CommandWord = WORD#3));
+// Reset Evaluation
+IF rtReset.Q AND FaultActive THEN
+    IF NOT (FeedbackWay1 AND FeedbackWay2) AND NOT InvalidMode AND NOT InvalidCmd THEN
+        FaultActive := FALSE;
+        FaultCode   := 0;
+        
+        // Immediately resolve state to prevent 1-scan IDLE bounce
+        IF FeedbackWay1 AND NOT FeedbackWay2 THEN State := STATE_AT_WAY1;
+        ELSIF FeedbackWay2 AND NOT FeedbackWay1 THEN State := STATE_AT_WAY2;
+        ELSE State := STATE_IDLE;
+        END_IF;
+    END_IF;
+END_IF;
+// Active Fault Monitoring (Evaluated only if not already faulted)
+IF NOT FaultActive THEN
+    IF InvalidMode THEN
+        FaultActive := TRUE; FaultCode := 110; State := STATE_FAULT;
+    ELSIF InvalidCmd THEN
+        FaultActive := TRUE; FaultCode := 111; State := STATE_FAULT;
+    ELSIF FeedbackWay1 AND FeedbackWay2 THEN
+        FaultActive := TRUE; FaultCode := 103; State := STATE_FAULT; // Sensor Conflict
+    ELSIF NOT Enable AND (ModeWord = WORD#1) AND (State = STATE_MOVE_WAY1 OR State = STATE_MOVE_WAY2) THEN
+        FaultActive := TRUE; FaultCode := 107; State := STATE_FAULT; // Enable lost during auto move
+    (*ELSIF (State = STATE_MOVE_WAY1) AND FeedbackWay2 THEN
+        FaultActive := TRUE; FaultCode := 112; State := STATE_FAULT; // Wrong sensor hit
+    ELSIF (State = STATE_MOVE_WAY2) AND FeedbackWay1 THEN
+        FaultActive := TRUE; FaultCode := 113; State := STATE_FAULT; // Wrong sensor hit*)
+    ELSIF (State = STATE_AT_WAY1) AND ExecuteWay1 THEN
+        FaultActive := TRUE; FaultCode := 114; State := STATE_FAULT; // Commanded to current pos
+    ELSIF (State = STATE_AT_WAY2) AND ExecuteWay2 THEN
+        FaultActive := TRUE; FaultCode := 115; State := STATE_FAULT; // Commanded to current pos
+    ELSIF tonNoFeedback.Q THEN
+        FaultActive := TRUE; FaultCode := 108; State := STATE_FAULT; // Loss of position
+    END_IF;
+END_IF;
+(* ========================================================================== *)
+(* 6. STATE MACHINE                                                           *)
+(* ========================================================================== *)
+CASE State OF
+    STATE_IDLE:
+        iOutWay1 := FALSE;
+        iOutWay2 := FALSE;
+        
+        IF FeedbackWay1 AND NOT FeedbackWay2 THEN State := STATE_AT_WAY1;
+        ELSIF FeedbackWay2 AND NOT FeedbackWay1 THEN State := STATE_AT_WAY2;
+        END_IF;
+        
+        IF ExecuteWay1 THEN State := STATE_MOVE_WAY1;
+        ELSIF ExecuteWay2 THEN State := STATE_MOVE_WAY2;
+        END_IF;
+    STATE_MOVE_WAY1:
+        iOutWay1 := TRUE;
+        iOutWay2 := FALSE;
+        
+        IF FeedbackWay1 THEN
+            iOutWay1 := FALSE;
+            State := STATE_AT_WAY1;
+        ELSIF tonMoveTimer.Q THEN
+            iOutWay1 := FALSE; 
+            FaultActive := TRUE; FaultCode := 101; State := STATE_FAULT;
+        END_IF;
+    STATE_MOVE_WAY2:
+        iOutWay1 := FALSE;
+        iOutWay2 := TRUE;
+        
+        IF FeedbackWay2 THEN
+            iOutWay2 := FALSE;
+            State := STATE_AT_WAY2;
+        ELSIF tonMoveTimer.Q THEN
+            iOutWay2 := FALSE; 
+            FaultActive := TRUE; FaultCode := 102; State := STATE_FAULT;
+        END_IF;
+    STATE_AT_WAY1:
+        iOutWay1 := FALSE; iOutWay2 := FALSE;
+        IF ExecuteWay2 THEN State := STATE_MOVE_WAY2; END_IF;
+    STATE_AT_WAY2:
+        iOutWay1 := FALSE; iOutWay2 := FALSE;
+        IF ExecuteWay1 THEN State := STATE_MOVE_WAY1; END_IF;
+    STATE_FAULT:
+        iOutWay1 := FALSE; iOutWay2 := FALSE;
+    ELSE
+        iOutWay1 := FALSE; iOutWay2 := FALSE;
+        FaultActive := TRUE; FaultCode := 106; State := STATE_FAULT;
+END_CASE;
+(* ========================================================================== *)
+(* 7. OUTPUT ASSIGNMENT & SAFE STATE OVERRIDE                                 *)
+(* ========================================================================== *)
+// Enforce Safe State (Faults)
+IF FaultActive THEN
+    iOutWay1 := FALSE;
+    iOutWay2 := FALSE;
+END_IF;
+// Enforce Safe State (Out Of Service)
+IF (ModeWord = WORD#2) THEN
+    iOutWay1 := FALSE;
+    iOutWay2 := FALSE;
+    IF NOT FaultActive THEN
+        State := STATE_IDLE; 
+    END_IF;
+END_IF;
+// Assign Physical Outputs Once
+OutputWay1 := iOutWay1;
+OutputWay2 := iOutWay2;
+(* ========================================================================== *)
+(* 8. STATUS PACKING FOR HMI                                                  *)
+(* ========================================================================== *)
+StatusWord := WORD#0; 
+StatusWord.%X0 := NOT FaultActive AND (ModeWord <> WORD#2) 
+                  AND (State = STATE_IDLE OR State = STATE_AT_WAY1 OR State = STATE_AT_WAY2);
+StatusWord.%X1 := iOutWay1 OR iOutWay2; // Actively firing valves
+StatusWord.%X2 := (State = STATE_MOVE_WAY1) OR (State = STATE_MOVE_WAY2);
+StatusWord.%X3 := (State = STATE_AT_WAY1) AND FeedbackWay1;
+StatusWord.%X4 := (State = STATE_AT_WAY2) AND FeedbackWay2;
+StatusWord.%X5 := (ModeWord = WORD#0); // Manual Active
+StatusWord.%X6 := (ModeWord = WORD#1); // Auto Active
+StatusWord.%X7 := (ModeWord = WORD#2); // OOS Active
+StatusWord.%X8 := (ModeWord = WORD#3); // Bypass Active
+StatusWord.%X15 := FaultActive;
